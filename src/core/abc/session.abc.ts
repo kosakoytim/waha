@@ -1,5 +1,8 @@
+import { MessageCappingTracker } from '@waha/core/abc/MessageCappingTracker';
+import { ReachoutTimelockTracker } from '@waha/core/abc/ReachoutTimelockTracker';
 import { getBrowserExecutablePath as getBrowserExecutablePathAutodetect } from '@waha/core/abc/session.browser';
-import { IMediaConverter } from '@waha/core/media/IConverter';
+import { PluginRegistry } from '@waha/core/abc/session.plugin.registry';
+import { IMediaConverter } from '@waha/core/media/IMediaConverter';
 import { Ffmpeg } from '@waha/core/utils/ffmpeg';
 import { MessagesForRead } from '@waha/core/utils/convertors';
 import {
@@ -35,7 +38,7 @@ import { BinaryFile, RemoteFile } from '@waha/structures/files.dto';
 import { Label, LabelDTO, LabelID } from '@waha/structures/labels.dto';
 import { LidToPhoneNumber } from '@waha/structures/lids.dto';
 import { PaginationParams } from '@waha/structures/pagination.dto';
-import { MessageSource, WAMessage } from '@waha/structures/responses.dto';
+import { WAMessage } from '@waha/structures/responses.dto';
 import { BrowserTraceQuery } from '@waha/structures/server.debug.dto';
 import { DefaultMap } from '@waha/utils/DefaultMap';
 import { generatePrefixedId } from '@waha/utils/ids';
@@ -64,6 +67,10 @@ import { distinctUntilChanged, map } from 'rxjs/operators';
 import { MessageId } from 'whatsapp-web.js';
 
 import {
+  PasskeyChallenge,
+  PasskeyConfirmationResponse,
+} from '../../structures/auth.dto';
+import {
   ChatRequest,
   CheckNumberStatusQuery,
   EditMessageRequest,
@@ -80,6 +87,7 @@ import {
   MessageReactionRequest,
   MessageReplyRequest,
   MessageStarRequest,
+  MessageStickerRequest,
   MessageTextRequest,
   MessageVideoRequest,
   MessageVoiceRequest,
@@ -100,16 +108,25 @@ import { EventMessageRequest } from '../../structures/events.dto';
 import {
   CreateGroupRequest,
   GroupField,
+  GroupJoinRequest,
+  GroupJoinRequestResult,
   GroupParticipant,
   GroupsListFields,
   ParticipantsRequest,
+  SettingsMemberAddMode,
+  SettingsMemberShareHistoryMode,
+  SettingsMembershipApproval,
   SettingsSecurityChangeInfo,
 } from '../../structures/groups.dto';
 import { WAHAChatPresences } from '../../structures/presence.dto';
 import {
   MeInfo,
+  MessageCappingData,
+  MessageCappingStatus,
   ProxyConfig,
+  ReachoutTimelockData,
   SessionConfig,
+  SessionInfo,
 } from '../../structures/sessions.dto';
 import {
   DeleteStatusRequest,
@@ -126,15 +143,11 @@ import {
   AvailableInPlusVersion,
   NotImplementedByEngineError,
 } from '../exceptions';
-import { IMediaManager } from '../media/IMediaManager';
+import { IMediaManager, MediaDownloadOptions } from '../media/IMediaManager';
 import { QR } from '../QR';
 import { DataStore } from './DataStore';
 import { fetchBuffer } from '@waha/utils/fetch';
-import {
-  PRESENCE_AUTO_ONLINE,
-  PRESENCE_AUTO_ONLINE_DURATION_SECONDS,
-} from '@waha/core/env';
-import { Activity } from '@waha/core/abc/activity';
+import { SessionHooks } from './session.hooks';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const qrcode = require('qrcode-terminal');
@@ -149,6 +162,11 @@ export function ensureSuffix(phone) {
   return phone + suffix;
 }
 
+interface MediaConfig {
+  api: MediaDownloadOptions;
+  events: MediaDownloadOptions;
+}
+
 export interface SessionParams {
   name: string;
   printQR: boolean;
@@ -161,6 +179,21 @@ export interface SessionParams {
   engineConfig?: any;
   // Ignore settings
   ignore: IgnoreJidConfig;
+  // Media config
+  media: MediaConfig;
+}
+
+/**
+ * A status change, along with the extra info that belongs to that status
+ * (if any) - like the passkey challenge for PASSKEY_REQUIRED.
+ */
+interface SessionStatusUpdate {
+  status: WAHASessionStatus;
+  data: any;
+}
+
+interface SessionStatusUpdatePoint extends SessionStatusUpdate {
+  timestamp: number;
 }
 
 export abstract class WhatsappSession {
@@ -173,37 +206,30 @@ export abstract class WhatsappSession {
   protected sessionStore: DataStore;
   protected proxyConfig?: ProxyConfig;
   public sessionConfig?: SessionConfig;
+  protected media: MediaConfig;
   protected engineConfig?: any;
   protected unpairing: boolean = false;
   protected jids: JidFilter;
 
   private _status: WAHASessionStatus;
+  private _statusData: any = null;
+  protected reachoutTimelock: ReachoutTimelockTracker;
+  protected messageCapping: MessageCappingTracker;
   private _presence:
     | WAHAPresenceStatus.ONLINE
     | WAHAPresenceStatus.OFFLINE
     | null = null;
-  private lastActivityTimestamp?: number;
-  protected presenceAutoOnlineConfig = {
-    enabled: PRESENCE_AUTO_ONLINE,
-    duration: PRESENCE_AUTO_ONLINE_DURATION_SECONDS * 1000,
-  };
 
   private shouldPrintQR: boolean;
   protected events2: DefaultMap<WAHAEvents, SwitchObservable<any>>;
-  private status$: Subject<WAHASessionStatus>;
+  private status$: Subject<SessionStatusUpdate>;
   protected profilePictures: NodeCache = new NodeCache({
     stdTTL: 24 * 60 * 60, // 1 day
   });
 
-  // Save sent messages ids in cache so we can determine if a message was sent
-  // via API or APP
-  private sentMessageIds: NodeCache = new NodeCache({
-    stdTTL: 10 * 60, // 10 minutes
-  });
-
-  private presenceOfflineTimeout?: ReturnType<typeof setTimeout>;
-
   public mediaConverter: IMediaConverter;
+  public hooks: SessionHooks;
+  public plugins: PluginRegistry;
 
   public constructor({
     name,
@@ -215,15 +241,36 @@ export abstract class WhatsappSession {
     sessionConfig,
     engineConfig,
     ignore,
+    media,
   }: SessionParams) {
     this._status = WAHASessionStatus.STOPPED;
-    this.status$ = new Subject<WAHASessionStatus>();
-
+    this.status$ = new Subject<SessionStatusUpdate>();
     this.name = name;
     this.proxyConfig = proxyConfig;
     this.loggerBuilder = loggerBuilder;
     this.logger = loggerBuilder.child({ name: 'WhatsappSession' });
+    this.hooks = new SessionHooks();
+    this.plugins = new PluginRegistry(this);
+
     this.mediaConverter = new Ffmpeg(this.name, this.logger);
+    this.reachoutTimelock = new ReachoutTimelockTracker(this.logger);
+    this.reachoutTimelock.changes$.subscribe((timelock) => {
+      if (this.status === WAHASessionStatus.WORKING) {
+        // Re-issue WORKING so 'session.status' consumers get the update
+        this.setStatus(WAHASessionStatus.WORKING, {
+          reachoutTimelock: timelock,
+        });
+      }
+    });
+    this.messageCapping = new MessageCappingTracker(this.logger);
+    this.messageCapping.changes$.subscribe((capping) => {
+      if (this.status === WAHASessionStatus.WORKING) {
+        // Re-issue WORKING so 'session.status' consumers get the update
+        this.setStatus(WAHASessionStatus.WORKING, {
+          messageCapping: capping,
+        });
+      }
+    });
     this.events2 = new DefaultMap<WAHAEvents, SwitchObservable<any>>(
       (key) =>
         new SwitchObservable((obs$) => {
@@ -252,46 +299,56 @@ export abstract class WhatsappSession {
         // Wait for WORKING status to get all the info
         // https://github.com/devlikeapro/waha/issues/409
         .pipe(
-          switchMap((status: WAHASessionStatus) => {
+          switchMap((update: SessionStatusUpdate) => {
             const me = this.getSessionMeInfo();
             const hasMe = !!me?.pushName && !!me?.id;
             // Delay WORKING by 1 second if condition is met
             // Usually we get WORKING with all the info after
-            if (status === WAHASessionStatus.WORKING && !hasMe) {
-              return of(status).pipe(delay(2000));
+            if (update.status === WAHASessionStatus.WORKING && !hasMe) {
+              return of(update).pipe(delay(2000));
             }
-            return of(status);
+            return of(update);
           }),
-          // Remove consecutive duplicate WORKING statuses
+          // Remove consecutive duplicate WORKING statuses, but let through WORKING re-issued with new data
           distinctUntilChanged(
-            (prev, curr) => prev === curr && curr === WAHASessionStatus.WORKING,
+            (prev, curr) =>
+              prev.status === curr.status &&
+              curr.status === WAHASessionStatus.WORKING &&
+              lodash.isEqual(prev.data, curr.data),
           ),
           // attach current time (ms)
           timestamp(),
           map(
             ({ value, timestamp }) =>
               ({
-                status: value,
+                status: value.status,
                 timestamp: timestamp,
-              }) as SessionStatusPoint,
+                data: value.data,
+              }) as SessionStatusUpdatePoint,
           ),
           // keep the last 3 entries
-          scan<SessionStatusPoint, SessionStatusPoint[]>(
-            (statuses, status: SessionStatusPoint) => {
-              const next = [...statuses, status];
+          scan<SessionStatusUpdatePoint, SessionStatusUpdatePoint[]>(
+            (points, point: SessionStatusUpdatePoint) => {
+              const next = [...points, point];
               return next.length > 3 ? next.slice(-3) : next;
             },
             [],
           ),
           // shape final payload
-          map(
-            (statuses) =>
-              ({
-                name: this.name,
-                status: statuses.at(-1)?.status, // current
-                statuses: statuses,
-              }) as WASessionStatusBody,
-          ),
+          map((points) => {
+            const current = points.at(-1); // current
+            return {
+              name: this.name,
+              status: current?.status,
+              statuses: points.map(
+                (point): SessionStatusPoint => ({
+                  status: point.status,
+                  timestamp: point.timestamp,
+                }),
+              ),
+              data: current?.data ?? null,
+            } as WASessionStatusBody;
+          }),
         ),
     );
 
@@ -305,27 +362,73 @@ export abstract class WhatsappSession {
       'The session ignores the following chat ids',
     );
     this.jids = new JidFilter(ignore);
+
+    //
+    // Media options
+    //
+    this.media = media;
+    const mimetypes = this.media.events.mimetypes;
+    if (mimetypes && mimetypes.length > 0) {
+      const str = mimetypes.join(',');
+      const msg = `Only '${str}' mimetypes will be downloaded for the session`;
+      this.logger.info(msg);
+    }
   }
 
   public getEventObservable(event: WAHAEvents) {
     return this.events2.get(event);
   }
 
-  public set status(value: WAHASessionStatus) {
-    if (this.unpairing && value !== WAHASessionStatus.STOPPED) {
+  /**
+   * Set the status along with the extra info that belongs to it.
+   * Plain 'status = value' assignments go through here without data,
+   * so the data is dropped as soon as the session moves on.
+   */
+  protected setStatus(status: WAHASessionStatus, data: any = null) {
+    if (this.unpairing && status !== WAHASessionStatus.STOPPED) {
       // In case of unpairing
       // wait for STOPPED event, ignore the rest
       return;
     }
-    this._status = value;
-    this.status$.next(value);
+    if (status === WAHASessionStatus.WORKING && data == null) {
+      // Plain 'status = WORKING' assignments (reconnects) must keep carrying the
+      // active account-restriction info so 'session.status' consumers do not lose it
+      const carry: any = {};
+      if (this.reachoutTimelock.value?.isActive) {
+        carry.reachoutTimelock = this.reachoutTimelock.value;
+      }
+      const capping = this.messageCapping.value;
+      if (capping && capping.cappingStatus !== MessageCappingStatus.NONE) {
+        carry.messageCapping = capping;
+      }
+      if (Object.keys(carry).length > 0) {
+        data = carry;
+      }
+    }
+    if (
+      status === WAHASessionStatus.STOPPED ||
+      status === WAHASessionStatus.FAILED
+    ) {
+      this.reachoutTimelock?.stop();
+    }
+    this._status = status;
+    this._statusData = data;
+    this.status$.next({ status: status, data: data });
+  }
+
+  public set status(value: WAHASessionStatus) {
+    this.setStatus(value);
   }
 
   public get status() {
     return this._status;
   }
 
-  protected set presence(value: WAHAPresenceStatus) {
+  public get statusData() {
+    return this._statusData;
+  }
+
+  public set presence(value: WAHAPresenceStatus) {
     switch (value) {
       case null:
         this._presence = null;
@@ -438,6 +541,14 @@ export abstract class WhatsappSession {
     throw new NotImplementedByEngineError();
   }
 
+  public fetchMessageCapping(): Promise<MessageCappingData> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public fetchReachoutTimelock(): Promise<ReachoutTimelockData> {
+    throw new NotImplementedByEngineError();
+  }
+
   /**
    * Auth methods
    */
@@ -450,10 +561,34 @@ export abstract class WhatsappSession {
     throw new NotImplementedByEngineError();
   }
 
+  public getPasskeyChallenge(): PasskeyChallenge {
+    throw new NotImplementedByEngineError();
+  }
+
+  public async sendPasskeyResponse(responseJson: string): Promise<void> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public async confirmPasskey(): Promise<void> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public getPasskeyConfirmation(): PasskeyConfirmationResponse {
+    throw new NotImplementedByEngineError();
+  }
+
   abstract getScreenshot(): Promise<Buffer>;
 
   public getSessionMeInfo(): MeInfo | null {
     return null;
+  }
+
+  /**
+   * Builds the runtime session info via the "session.info" hook.
+   */
+  public getSessionInfo(): Promise<SessionInfo> {
+    const info = {} as SessionInfo;
+    return this.hooks.session.info.promise(info);
   }
 
   /**
@@ -552,6 +687,10 @@ export abstract class WhatsappSession {
     throw new NotImplementedByEngineError();
   }
 
+  sendSticker(request: MessageStickerRequest) {
+    throw new NotImplementedByEngineError();
+  }
+
   sendButtons(request: SendButtonsRequest) {
     throw new NotImplementedByEngineError();
   }
@@ -571,75 +710,6 @@ export abstract class WhatsappSession {
   abstract startTyping(chat: ChatRequest): Promise<void>;
 
   abstract stopTyping(chat: ChatRequest);
-
-  /**
-   * Activity tracking and presence management
-   */
-
-  /**
-   * Returns the timestamp of the last "activity" in the session
-   * @returns Timestamp in milliseconds or undefined if there was never any activity
-   */
-  public getLastActivityTimestamp(): number | undefined {
-    return this.lastActivityTimestamp;
-  }
-
-  /**
-   * Maintains ONLINE presence active while there is activity
-   * Resets the timer on each activity, only goes OFFLINE after Xs without activity
-   */
-  async maintainPresenceOnline(): Promise<void> {
-    if (!this.presenceAutoOnlineConfig.enabled) {
-      return;
-    }
-    if (this.status !== WAHASessionStatus.WORKING) {
-      return;
-    }
-    this.lastActivityTimestamp = Date.now();
-    // If not ONLINE yet, send ONLINE
-    if (this._presence !== WAHAPresenceStatus.ONLINE) {
-      try {
-        // Force set ONLINE in case of many requests comes at the same time
-        // So we'll set ONLINE exactly once
-        this.presence = WAHAPresenceStatus.ONLINE;
-        await this.setPresence(WAHAPresenceStatus.ONLINE);
-        this.logger.debug('Set presence to ONLINE due to activity');
-      } catch (error) {
-        this.logger.debug('Failed to set presence ONLINE', error);
-        return;
-      }
-    }
-    // Cancel the previous timeout (if exists)
-    this.cleanupPresenceTimeout();
-
-    // Schedule to go back OFFLINE after timeout without activity
-    this.presenceOfflineTimeout = setTimeout(async () => {
-      try {
-        const working = this.status === WAHASessionStatus.WORKING;
-        const online = this.presence === WAHAPresenceStatus.ONLINE;
-        if (!working || !online) {
-          // Nothing to do
-          return;
-        }
-        await this.setPresence(WAHAPresenceStatus.OFFLINE);
-        this.logger.debug(
-          'Auto-set presence to OFFLINE after time without activity',
-        );
-      } catch (error) {
-        this.presence = WAHAPresenceStatus.OFFLINE;
-        this.logger.debug('Failed to set presence OFFLINE', error);
-      }
-      this.cleanupPresenceTimeout();
-    }, this.presenceAutoOnlineConfig.duration);
-  }
-
-  /**
-   * Cleans up the timeout when the session stops
-   */
-  protected cleanupPresenceTimeout() {
-    clearTimeout(this.presenceOfflineTimeout);
-    this.presenceOfflineTimeout = null;
-  }
 
   abstract setReaction(request: MessageReactionRequest);
 
@@ -948,6 +1018,58 @@ export abstract class WhatsappSession {
     throw new NotImplementedByEngineError();
   }
 
+  public getMemberAddMode(id): Promise<SettingsMemberAddMode> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public setMemberAddMode(id, value) {
+    throw new NotImplementedByEngineError();
+  }
+
+  public getMemberShareHistoryMode(
+    id: string,
+  ): Promise<SettingsMemberShareHistoryMode> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public setMemberShareHistoryMode(
+    id: string,
+    value: boolean,
+  ): Promise<boolean> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public getMembershipApprovalMode(
+    id: string,
+  ): Promise<SettingsMembershipApproval> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public setMembershipApprovalMode(
+    id: string,
+    value: boolean,
+  ): Promise<boolean> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public getGroupJoinRequests(id: string): Promise<GroupJoinRequest[]> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public approveGroupJoinRequests(
+    id: string,
+    request: ParticipantsRequest,
+  ): Promise<GroupJoinRequestResult[]> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public rejectGroupJoinRequests(
+    id: string,
+    request: ParticipantsRequest,
+  ): Promise<GroupJoinRequestResult[]> {
+    throw new NotImplementedByEngineError();
+  }
+
   public deleteGroup(id) {
     throw new NotImplementedByEngineError();
   }
@@ -1142,14 +1264,6 @@ export abstract class WhatsappSession {
    * END - Methods for API
    */
 
-  /**
-   * Add WhatsApp suffix (@c.us) to the phone number if it doesn't have it yet
-   * @param phone
-   */
-  protected ensureSuffix(phone) {
-    return ensureSuffix(phone);
-  }
-
   protected deserializeId(messageId: string): MessageId {
     const parts = messageId.split('_');
     return {
@@ -1176,18 +1290,6 @@ export abstract class WhatsappSession {
     qrcode.generate(qr.raw, { small: true });
   }
 
-  protected saveSentMessageId(id: string) {
-    this.sentMessageIds.set(id, true);
-  }
-
-  protected getMessageSource(id: string): MessageSource {
-    if (!id) {
-      return MessageSource.APP;
-    }
-    const api = this.sentMessageIds.has(id);
-    return api ? MessageSource.API : MessageSource.APP;
-  }
-
   /**
    * Fetches the content from the specified URL and returns it as a Buffer.
    */
@@ -1212,8 +1314,8 @@ export function getGroupInviteLink(code: string) {
 }
 
 export function parseGroupInviteLink(link: string) {
-  // https://chat.whatsapp.com/123 => 123
-  return link.split('/').pop();
+  // https://chat.whatsapp.com/123?s=sw&p=a => 123
+  return parseInviteCode(link);
 }
 
 export function getChannelInviteLink(code: string) {
@@ -1222,8 +1324,13 @@ export function getChannelInviteLink(code: string) {
 
 export function parseChannelInviteLink(link: string): string {
   // https://www.whatsapp.com/channel/123 => 123
-  const code = link.split('/').pop();
-  return code;
+  return parseInviteCode(link);
+}
+
+function parseInviteCode(link: string): string {
+  // last path segment, without share tracking query params and hash
+  const path = link.split(/[?#]/)[0];
+  return path.split('/').pop();
 }
 
 export function getPublicUrlFromDirectPath(directPath: string) {

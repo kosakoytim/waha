@@ -2,23 +2,31 @@ import { WebjsClientCore } from '@waha/core/engines/webjs/WebjsClientCore';
 import {
   GroupId,
   GroupInfo,
+  GroupJoinRequest,
+  GroupJoinRequestResult,
   GroupParticipant,
   GroupParticipantRole,
+  NormalizeJoinRequestMethod,
 } from '@waha/structures/groups.dto';
 import {
+  GroupParticipantsJoinRequestAction,
   GroupParticipantType,
   GroupV2JoinEvent,
   GroupV2LeaveEvent,
+  GroupV2ParticipantsJoinRequestEvent,
   GroupV2ParticipantsEvent,
   GroupV2UpdateEvent,
 } from '@waha/structures/groups.events.dto';
 import {
   GroupChat,
+  GroupMembershipRequest as WEBJSGroupJoinRequest,
   GroupNotification,
   GroupNotificationTypes,
   GroupParticipant as WEBJSGroupParticipant,
+  MembershipRequestActionResult as WEBJSMembershipRequestActionResult,
 } from 'whatsapp-web.js';
 import { isPnUser } from '@waha/core/utils/jids';
+import { GetSerialized } from '@waha/core/utils/serialized';
 
 function ToGroupInfo(
   group: GroupChat,
@@ -29,16 +37,72 @@ function ToGroupInfo(
   const groupMetadata = group.groupMetadata;
   const info: GroupInfo = {
     // @ts-ignore
-    id: group.id._serialized,
+    id: GetSerialized(group.id),
     subject: group.name,
     description: group.description,
     invite: invite,
-    membersCanAddNewMember: groupMetadata.restrict,
+    membersCanAddNewMember: groupMetadata.memberAddMode === 'all_member_add',
     membersCanSendMessages: groupMetadata.announce,
-    newMembersApprovalRequired: groupMetadata.membershipApprovalMode,
+    newMembersApprovalRequired: ToGroupMembershipApprovalRequired(
+      groupMetadata.membershipApprovalMode,
+    ),
     participants: participants,
   };
   return info;
+}
+
+export function ToGroupMembershipApprovalRequired(value: unknown): boolean {
+  return value === true || value === 1;
+}
+
+export function ToGroupJoinRequest(
+  request: WEBJSGroupJoinRequest,
+): GroupJoinRequest {
+  const requesterId = GetSerialized(request.id);
+  if (!requesterId) {
+    throw new Error('Unable to serialize group membership requester ID');
+  }
+  return {
+    requesterId: requesterId,
+    addedById: GetSerialized(request.addedBy),
+    parentGroupId: GetSerialized(request.parentGroupId),
+    requestMethod: NormalizeJoinRequestMethod(request.requestMethod),
+    timestamp: request.t,
+  };
+}
+
+export function ToGroupJoinRequestResults(
+  result: WEBJSMembershipRequestActionResult,
+): GroupJoinRequestResult[] {
+  // whatsapp-web.js may report one result for multiple requesters - flatten to one entry per requester
+  let requesterIds: (string | null)[];
+  if (Array.isArray(result.requesterId)) {
+    requesterIds = result.requesterId;
+  } else {
+    requesterIds = [result.requesterId ?? null];
+  }
+  return requesterIds.map((requesterId) => ({
+    requesterId: requesterId,
+    success: !result.error,
+    error: result.error,
+  }));
+}
+
+export function ToGroupV2ParticipantsJoinRequestEvent(
+  notification: GroupNotification,
+): GroupV2ParticipantsJoinRequestEvent | null {
+  if (!notification.chatId || !notification.author) {
+    return null;
+  }
+  return {
+    group: {
+      id: notification.chatId,
+    },
+    action: GroupParticipantsJoinRequestAction.CREATED,
+    requesterId: notification.author,
+    timestamp: notification.timestamp,
+    _data: notification,
+  };
 }
 
 export async function ToGroupV2JoinEvent(
@@ -72,11 +136,10 @@ export function getParticipants(
       role = GroupParticipantRole.ADMIN;
     }
 
+    const participantId = GetSerialized(participant.id);
     return {
-      id: participant.id._serialized,
-      pn: isPnUser(participant.id._serialized)
-        ? participant.id._serialized
-        : null,
+      id: participantId,
+      pn: isPnUser(participantId) ? participantId : null,
       role: role,
     };
   });
@@ -140,6 +203,7 @@ export function ToGroupV2ParticipantsEvent(
     (id) => {
       return {
         id: id,
+        pn: isPnUser(id) ? id : null,
         role: role,
       };
     },

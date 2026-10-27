@@ -1,4 +1,8 @@
-import { WebJSPresence } from '@waha/core/engines/webjs/types';
+import {
+  WebJSPresence,
+  WebJSPresenceUpdate,
+} from '@waha/core/engines/webjs/types';
+import { GetSerialized } from '@waha/core/utils/serialized';
 import { GetChatMessagesFilter } from '@waha/structures/chats.dto';
 import { Label } from '@waha/structures/labels.dto';
 import { LidToPhoneNumber } from '@waha/structures/lids.dto';
@@ -7,6 +11,7 @@ import { TextStatus } from '@waha/structures/status.dto';
 import { sleep } from '@waha/utils/promiseTimeout';
 import { EventEmitter } from 'events';
 import * as lodash from 'lodash';
+import { Logger } from 'pino';
 import { Page } from 'puppeteer';
 import { Client, Events, Message as WebjsMessage } from 'whatsapp-web.js';
 import { Message } from 'whatsapp-web.js/src/structures';
@@ -75,7 +80,7 @@ function extractReactionsByMessageKey(
 ): Map<string, ChannelMessageReaction[]> {
   const reactions = new Map();
   for (const reaction of newsletterReactions) {
-    const key = reaction.parentMsgKey._serialized;
+    const key = GetSerialized(reaction.parentMsgKey);
     const emojiCountMap = reaction.emojiCountMap;
     const reactionList: ChannelMessageReaction[] = [];
     for (const emoji in emojiCountMap) {
@@ -92,21 +97,31 @@ function extractReactionsByMessageKey(
 export class WebjsClientCore extends Client {
   public events = new EventEmitter();
   private wpage: WPage = null;
+  private injecting: Promise<void> = null;
 
   constructor(
     options,
     protected tags: boolean,
+    protected logger: Logger,
   ) {
     super(options);
     // Wait until it's READY and inject more utils
-    this.on(Events.AUTHENTICATED, async () => {
-      await this.attachCustomEventListeners();
-      await this.injectWaha();
-    });
-    this.on(Events.READY, async () => {
-      await this.attachCustomEventListeners();
-      await this.injectWaha();
-    });
+    // AUTHENTICATED and READY fire back to back - run one injection for both
+    this.on(Events.AUTHENTICATED, () => this.injectUtils());
+    this.on(Events.READY, () => this.injectUtils());
+  }
+
+  private injectUtils(): Promise<void> {
+    if (this.injecting) {
+      return this.injecting;
+    }
+    this.injecting = this.attachCustomEventListeners()
+      .then(() => this.injectWaha())
+      .catch((err) => this.logger.error(err, 'Failed to inject utils'))
+      .finally(() => {
+        this.injecting = null;
+      });
+    return this.injecting;
   }
 
   async initialize() {
@@ -127,19 +142,36 @@ export class WebjsClientCore extends Client {
   }
 
   /**
-   * @result indicating whether the UX fresh look was successfully hidden.
+   * @result indicating whether the "What's New" auto-modal was prevented or dismissed.
    */
-  hideUXFreshLook(): Promise<boolean> {
+  hideWhatsNewModal(): Promise<boolean> {
     return this.pupPage.evaluate(() => {
-      const WAWebUserPrefsUiRefresh = window.require('WAWebUserPrefsUiRefresh');
-      if (!WAWebUserPrefsUiRefresh) {
+      // Module registry is not available until the app bundle has loaded
+      if (typeof window.require !== 'function') {
         return false;
       }
-      if (WAWebUserPrefsUiRefresh.getUiRefreshNuxAcked()) {
+      const WAWebWhatsNewNux = window.require('WAWebWhatsNewNux');
+      if (!WAWebWhatsNewNux) {
         return false;
       }
-      WAWebUserPrefsUiRefresh.incrementNuxViewCount();
-      WAWebUserPrefsUiRefresh.setUiRefreshNuxAcked(true);
+      // user prefs are not writable before login
+      const WAWebUserPrefsMeUser = window.require('WAWebUserPrefsMeUser');
+      if (!WAWebUserPrefsMeUser.getMaybeMePnUser()) {
+        return false;
+      }
+      // The app checks the cool-off with AB-prop driven days (15 or 30)
+      const WAWebWhatsNewGatingUtils = window.require(
+        'WAWebWhatsNewGatingUtils',
+      );
+      const days =
+        WAWebWhatsNewGatingUtils?.getWhatsNewAutoModalCooldownDays?.();
+      const nux = WAWebWhatsNewNux.createWhatsNewNux(days);
+      if (!nux.shouldShow()) {
+        return false;
+      }
+      // Bump the dismiss count and start the cool-off, so the app never auto-opens the modal
+      nux.dismiss();
+      // If the modal has already opened - close the topmost modal (no-op when nothing is open)
       const WAWebModalManager = window.require('WAWebModalManager');
       WAWebModalManager.ModalManager.close();
       return true;
@@ -155,9 +187,109 @@ export class WebjsClientCore extends Client {
         return;
       },
     );
+    await exposeFunctionIfAbsent(
+      this.pupPage,
+      'onPresenceUpdate',
+      (data: WebJSPresenceUpdate) => {
+        this.events.emit('presence.update', data);
+        return;
+      },
+    );
+    await this.attachPresenceEvents();
     if (this.tags) {
       await this.attachTagsEvents();
     }
+  }
+
+  /**
+   * Presence lands in PresenceCollection on the main thread even when WhatsApp runs comms in a worker,
+   * so listen to the models instead of raw stanzas
+   */
+  async attachPresenceEvents() {
+    await this.pupPage.evaluate(() => {
+      // @ts-ignore
+      if (window.presenceEventsOn) {
+        return;
+      }
+      // @ts-ignore
+      window.presenceEventsOn = true;
+
+      const d = require;
+      const PresenceCollection = d(
+        'WAWebPresenceCollection',
+      ).PresenceCollection;
+      const WAWebApiContact = d('WAWebApiContact');
+
+      // Prefer the phone number id when the LID mapping is known
+      const toId = (wid) => {
+        let id = wid;
+        if (wid.isLid()) {
+          id = WAWebApiContact.getPhoneNumber(wid) ?? wid;
+        }
+        // @ts-ignore
+        return window.WWebJS.GetSerialized(id);
+      };
+
+      const toPresences = (presence) => {
+        if (!presence.isGroup) {
+          return [
+            {
+              participant: toId(presence.id),
+              lastSeen: presence.chatstate.t,
+              state: presence.chatstate.type,
+            },
+          ];
+        }
+        return presence.chatstates
+          .getModelsArray()
+          .filter((chatstate) => !!chatstate.type)
+          .map((chatstate) => {
+            return {
+              participant: toId(chatstate.id),
+              lastSeen: chatstate.t,
+              state: chatstate.type,
+            };
+          });
+      };
+
+      // type and t change in one set() - coalesce into a single event per presence
+      const pending = new Set<any>();
+      const flush = () => {
+        for (const presence of pending) {
+          // @ts-ignore
+          window.onPresenceUpdate({
+            id: toId(presence.id),
+            presences: toPresences(presence),
+          });
+        }
+        pending.clear();
+      };
+
+      const findPresence = (chatstate) => {
+        const presence = PresenceCollection.get(chatstate.id);
+        if (presence && presence.chatstate === chatstate) {
+          return presence;
+        }
+        // Group chatstate id is the participant, not the group
+        return PresenceCollection.getModelsArray().find(
+          (model) => model.chatstate === chatstate,
+        );
+      };
+
+      PresenceCollection.on(
+        'change:chatstate.type change:chatstate.t',
+        (chatstate) => {
+          const presence = findPresence(chatstate);
+          if (!presence || !presence.hasData) {
+            return;
+          }
+          if (pending.size === 0) {
+            queueMicrotask(flush);
+          }
+          pending.add(presence);
+        },
+      );
+    });
   }
 
   async attachTagsEvents() {
@@ -167,7 +299,7 @@ export class WebjsClientCore extends Client {
         return;
       }
 
-      const tags = ['receipt', 'presence', 'chatstate'];
+      const tags = ['receipt'];
       const WAWap = window.require('WAWap');
       // @ts-ignore
       window.decodeStanzaBack = WAWap.decodeStanza;
@@ -192,9 +324,14 @@ export class WebjsClientCore extends Client {
   async setPushName(name: string) {
     await this.ensureWahaInjected();
     await this.pupPage.evaluate(async (pushName) => {
-      return await window
-        .require('WAWebSetPushnameConnAction')
-        .setPushname(pushName);
+      // @ts-ignore
+      const WAWebSetPushnameConnAction = await window.WWebJS.requireLazy(
+        'WAWebSetPushnameConnAction',
+        {
+          'WAWebProfileDrawer.react': 'WAWebProfileDrawerLoadableRequireBundle',
+        },
+      );
+      return await WAWebSetPushnameConnAction.setPushname(pushName);
     }, name);
     if (this.info) {
       this.info.pushname = name;
@@ -266,7 +403,8 @@ export class WebjsClientCore extends Client {
         // Filter chats by IDs if filter is provided
         if (filter && filter.ids && filter.ids.length > 0) {
           chats = chats.filter((chat) =>
-            filter.ids.includes(chat.id._serialized),
+            // @ts-ignore
+            filter.ids.includes(window.WWebJS.GetSerialized(chat.id)),
           );
         }
 
@@ -382,7 +520,10 @@ export class WebjsClientCore extends Client {
           // Construct the initial anchor the same way wa-js does:
           // serialize to string then reconstruct via MsgKey.fromString so the
           // object has the exact shape msgFindByDirection expects.
-          const lastReceivedSerialized = chat.lastReceivedKey?._serialized;
+          // @ts-ignore
+          const lastReceivedSerialized = window.WWebJS.GetSerialized(
+            chat.lastReceivedKey,
+          );
           if (!lastReceivedSerialized) return [];
           let currentAnchorKey = window
             .require('WAWebMsgKey')
@@ -406,7 +547,8 @@ export class WebjsClientCore extends Client {
           // @ts-ignore
           const toModel = (m) => {
             if (m && typeof m.serialize === 'function') return m;
-            const serializedId = m?.id?._serialized;
+            // @ts-ignore
+            const serializedId = window.WWebJS.GetSerialized(m?.id);
             const Msg = window.require('WAWebCollections').Msg;
             if (serializedId) {
               const stored = Msg.get(serializedId);
@@ -437,7 +579,8 @@ export class WebjsClientCore extends Client {
             // appear in multiple batches when anchors overlap
             const seenIds = new Set();
             msgs = msgs.filter((m) => {
-              const sid = m?.id?._serialized;
+              // @ts-ignore
+              const sid = window.WWebJS.GetSerialized(m?.id);
               if (!sid || seenIds.has(sid)) return false;
               seenIds.add(sid);
               return true;
@@ -463,7 +606,10 @@ export class WebjsClientCore extends Client {
             // the oldest message in this batch — use it as the next anchor to
             // walk further back in history without overlap
             const oldestInBatch = batchModels[batchModels.length - 1];
-            const oldestSerialized = oldestInBatch?.id?._serialized;
+            // @ts-ignore
+            const oldestSerialized = window.WWebJS.GetSerialized(
+              oldestInBatch?.id,
+            );
             if (!oldestSerialized) break;
             currentAnchorKey = window
               .require('WAWebMsgKey')
@@ -532,9 +678,9 @@ export class WebjsClientCore extends Client {
         const result = values.map((map) => {
           return {
             // @ts-ignore
-            lid: map.lid._serialized,
+            lid: window.WWebJS.GetSerialized(map.lid),
             // @ts-ignore
-            pn: map.phoneNumber._serialized,
+            pn: window.WWebJS.GetSerialized(map.phoneNumber),
           };
         });
         // @ts-ignore
@@ -565,7 +711,8 @@ export class WebjsClientCore extends Client {
 
       const wid = WAWebWidFactory.createWid(lid);
       const result = WAWebApiContact.getPhoneNumber(wid);
-      return result ? result._serialized : null;
+      // @ts-ignore
+      return window.WWebJS.GetSerialized(result);
     }, lid);
     return pn;
   }
@@ -577,7 +724,8 @@ export class WebjsClientCore extends Client {
 
       const wid = WAWebWidFactory.createWid(pn);
       const result = WAWebApiContact.getCurrentLid(wid);
-      return result ? result._serialized : null;
+      // @ts-ignore
+      return window.WWebJS.GetSerialized(result);
     }, phoneNumber)) as any;
     return lid;
   }
@@ -585,44 +733,72 @@ export class WebjsClientCore extends Client {
   /**
    * Presences methods
    */
-  public async subscribePresence(chatId: string): Promise<void> {
-    await this.pupPage.evaluate(async (chatId) => {
-      const d = require;
-      const WidFactory = d('WAWebWidFactory');
 
-      const wid = WidFactory.createWidFromWidLike(chatId);
-      const chat = d('WAWebChatCollection').ChatCollection.get(wid);
-      const tc = chat == null ? void 0 : chat.getTcToken();
-      await d('WAWebContactPresenceBridge').subscribePresence(wid, tc);
+  /**
+   * WhatsApp keys 1:1 presence by LID on LID-migrated accounts, so map @c.us to the current LID when known
+   */
+  private async getPresenceKey(chatId: string): Promise<string> {
+    return await this.pupPage.evaluate((chatId) => {
+      const d = require;
+      const wid = d('WAWebWidFactory').createWidFromWidLike(chatId);
+      if (wid.isGroup() || wid.isLid()) {
+        return chatId;
+      }
+      const lid = d('WAWebApiContact').getCurrentLid(wid);
+      if (!lid) {
+        return chatId;
+      }
+      // @ts-ignore
+      return window.WWebJS.GetSerialized(lid);
     }, chatId);
   }
 
-  private async getCurrentPresence(chatId: string): Promise<WebJSPresence[]> {
-    const result = await this.pupPage.evaluate(async (chatId) => {
+  public async subscribePresence(chatId: string): Promise<void> {
+    const key = await this.getPresenceKey(chatId);
+    await this.pupPage.evaluate(async (chatId) => {
       const d = require;
-      const WidFactory = d('WAWebWidFactory');
-      const PresenceCollection = d(
-        'WAWebPresenceCollection',
-      ).PresenceCollection;
-      const wid = WidFactory.createWidFromWidLike(chatId);
-      const presence = PresenceCollection.get(wid);
-      if (!presence) {
-        return [];
-      }
-      let chatstates = [];
-      if (chatId.endsWith('@c.us')) {
-        chatstates = [presence.chatstate];
-      } else {
-        chatstates = presence.chatstates.getModelsArray();
-      }
-      return chatstates.map((chatstate) => {
-        return {
-          participant: chatstate.id._serialized,
-          lastSeen: chatstate.t,
-          state: chatstate.type,
-        };
-      });
-    }, chatId);
+      const wid = d('WAWebWidFactory').createWidFromWidLike(chatId);
+      // find() subscribes user or group presence the same way the app does
+      await d('WAWebPresenceCollection').PresenceCollection.find(wid);
+    }, key);
+  }
+
+  private async getCurrentPresence(chatId: string): Promise<WebJSPresence[]> {
+    const key = await this.getPresenceKey(chatId);
+    const result = await this.pupPage.evaluate(
+      async (chatId, key) => {
+        const d = require;
+        const WidFactory = d('WAWebWidFactory');
+        const PresenceCollection = d(
+          'WAWebPresenceCollection',
+        ).PresenceCollection;
+        const wid = WidFactory.createWidFromWidLike(key);
+        const presence = PresenceCollection.get(wid);
+        if (!presence) {
+          return [];
+        }
+        if (wid.isGroup()) {
+          return presence.chatstates.getModelsArray().map((chatstate) => {
+            return {
+              // @ts-ignore
+              participant: window.WWebJS.GetSerialized(chatstate.id),
+              lastSeen: chatstate.t,
+              state: chatstate.type,
+            };
+          });
+        }
+        // Report the id the caller asked for, not the LID key
+        return [
+          {
+            participant: chatId,
+            lastSeen: presence.chatstate.t,
+            state: presence.chatstate.type,
+          },
+        ];
+      },
+      chatId,
+      key,
+    );
     return result;
   }
 
@@ -681,7 +857,7 @@ export class WebjsClientCore extends Client {
     const messages: WebjsChannelMessage[] = messageInstances.map((msg) => {
       return {
         message: msg,
-        reactions: reactions.get(msg.id._serialized) || [],
+        reactions: reactions.get(GetSerialized(msg.id)) || [],
         viewCount: msg.rawData.viewCount,
       };
     });

@@ -8,6 +8,7 @@ import { SessionTools } from '@waha/apps/mcp/tools/sessions.tools';
 import { ChatTools } from '@waha/apps/mcp/tools/chats.tools';
 import { WAHASelf } from '@waha/apps/app_sdk/waha/WAHASelf';
 import { ApiTools } from '@waha/apps/mcp/tools/api.tools';
+import { AppsTools } from '@waha/apps/mcp/tools/apps.tools';
 import { CallTools } from '@waha/apps/mcp/tools/calls.tools';
 import { ChannelTools } from '@waha/apps/mcp/tools/channels.tools';
 import { ContactTools } from '@waha/apps/mcp/tools/contacts.tools';
@@ -19,6 +20,7 @@ import { PresenceTools } from '@waha/apps/mcp/tools/presence.tools';
 import { ProfileTools } from '@waha/apps/mcp/tools/profile.tools';
 import { StatusTools } from '@waha/apps/mcp/tools/status.tools';
 import { ServerTools } from '@waha/apps/mcp/tools/server.tools';
+import { KeysTools } from '@waha/apps/mcp/tools/keys.tools';
 
 @Injectable()
 export class McpService {
@@ -42,6 +44,8 @@ export class McpService {
       new ProfileTools(api),
       new StatusTools(api),
       new ServerTools(api),
+      new KeysTools(api),
+      new AppsTools(api),
     ]);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless

@@ -18,10 +18,22 @@ import {
   UnpinMessageInput,
 } from '@waha/apps/mcp/tools/chats.zod';
 
-function FetchMediaUsingApiKeyContent(key: string) {
+function FetchMediaContent(key: string | null) {
+  if (key) {
+    return {
+      type: 'text' as const,
+      text:
+        `To fetch media use "X-Api-Key: ${key}" HTTP header. ` +
+        `To open it in a browser add "?x-api-key=${key}" to the query params. ` +
+        `This is a media-only API key: it can ONLY download files for this session — ` +
+        `it cannot read messages, send, or control the session.`,
+    };
+  }
   return {
     type: 'text' as const,
-    text: `To fetch media use "X-Api-Key: ${key}" HTTP header. If the user wants to open it - add "?x-api-key=${key}" to query params`,
+    text:
+      `To fetch media, use your existing WAHA API key in the "X-Api-Key" HTTP header ` +
+      `(or append "?x-api-key=YOUR_API_KEY" to open it in a browser).`,
   };
 }
 
@@ -133,7 +145,8 @@ export class ChatTools extends McpController {
     description:
       'Get messages in a chat. ' +
       'To retrieve all messages, paginate by incrementing the offset by limit until the returned array is empty or shorter than the limit. ' +
-      'To fetch media for a specific message, use chats-get-message with that message id and downloadMedia=true instead of fetching it here.',
+      'To fetch media for a specific message, use chats-get-message with that message id and downloadMedia=true instead of fetching it here. ' +
+      'Use downloadMediaMimetypes to download only media with the given mimetypes (prefix match).',
     inputSchema: ChatMessagesInput,
     annotations: {
       readOnlyHint: true,
@@ -150,7 +163,10 @@ export class ChatTools extends McpController {
     const response = await this.request({
       method: 'GET',
       url: `/api/${session}/chats/${chatId}/messages`,
-      params: query,
+      params: {
+        ...query,
+        downloadMediaMimetypes: query.downloadMediaMimetypes?.join(','),
+      },
     });
     let messages = response.data;
     if (!_data && Array.isArray(messages)) {
@@ -170,7 +186,8 @@ export class ChatTools extends McpController {
       JSON.stringify({ status: response.status, response: responseText }),
     );
     if (query.downloadMedia) {
-      result.content.push(FetchMediaUsingApiKeyContent(this.api.key));
+      const mediaKey = await this.mediaApiKey(session);
+      result.content.push(FetchMediaContent(mediaKey));
     }
     return result;
   }
@@ -216,10 +233,14 @@ export class ChatTools extends McpController {
     const result = await this.textRequest({
       method: 'GET',
       url: `/api/${session}/chats/${chatId}/messages/${messageId}`,
-      params: query,
+      params: {
+        ...query,
+        downloadMediaMimetypes: query.downloadMediaMimetypes?.join(','),
+      },
     });
     if (query.downloadMedia) {
-      result.content.push(FetchMediaUsingApiKeyContent(this.api.key));
+      const mediaKey = await this.mediaApiKey(session);
+      result.content.push(FetchMediaContent(mediaKey));
     }
     return result;
   }

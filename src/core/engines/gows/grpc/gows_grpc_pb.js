@@ -488,6 +488,17 @@ function deserialize_messages_PairCodeResponse(buffer_arg) {
   return gows_pb.PairCodeResponse.deserializeBinary(new Uint8Array(buffer_arg));
 }
 
+function serialize_messages_PasskeyResponseRequest(arg) {
+  if (!(arg instanceof gows_pb.PasskeyResponseRequest)) {
+    throw new Error('Expected argument of type messages.PasskeyResponseRequest');
+  }
+  return Buffer.from(arg.serializeBinary());
+}
+
+function deserialize_messages_PasskeyResponseRequest(buffer_arg) {
+  return gows_pb.PasskeyResponseRequest.deserializeBinary(new Uint8Array(buffer_arg));
+}
+
 function serialize_messages_PresenceRequest(arg) {
   if (!(arg instanceof gows_pb.PresenceRequest)) {
     throw new Error('Expected argument of type messages.PresenceRequest');
@@ -686,6 +697,17 @@ function deserialize_messages_UpdateParticipantsRequest(buffer_arg) {
   return gows_pb.UpdateParticipantsRequest.deserializeBinary(new Uint8Array(buffer_arg));
 }
 
+function serialize_messages_UpdateRequestParticipantsRequest(arg) {
+  if (!(arg instanceof gows_pb.UpdateRequestParticipantsRequest)) {
+    throw new Error('Expected argument of type messages.UpdateRequestParticipantsRequest');
+  }
+  return Buffer.from(arg.serializeBinary());
+}
+
+function deserialize_messages_UpdateRequestParticipantsRequest(buffer_arg) {
+  return gows_pb.UpdateRequestParticipantsRequest.deserializeBinary(new Uint8Array(buffer_arg));
+}
+
 function serialize_messages_UpsertLabelRequest(arg) {
   if (!(arg instanceof gows_pb.UpsertLabelRequest)) {
     throw new Error('Expected argument of type messages.UpsertLabelRequest');
@@ -763,6 +785,28 @@ startSession: {
     requestDeserialize: deserialize_messages_PairCodeRequest,
     responseSerialize: serialize_messages_PairCodeResponse,
     responseDeserialize: deserialize_messages_PairCodeResponse,
+  },
+  submitPasskeyResponse: {
+    path: '/messages.MessageService/SubmitPasskeyResponse',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.PasskeyResponseRequest,
+    responseType: gows_pb.Empty,
+    requestSerialize: serialize_messages_PasskeyResponseRequest,
+    requestDeserialize: deserialize_messages_PasskeyResponseRequest,
+    responseSerialize: serialize_messages_Empty,
+    responseDeserialize: deserialize_messages_Empty,
+  },
+  confirmPasskey: {
+    path: '/messages.MessageService/ConfirmPasskey',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.Session,
+    responseType: gows_pb.Empty,
+    requestSerialize: serialize_messages_Session,
+    requestDeserialize: deserialize_messages_Session,
+    responseSerialize: serialize_messages_Empty,
+    responseDeserialize: deserialize_messages_Empty,
   },
   logout: {
     path: '/messages.MessageService/Logout',
@@ -1017,6 +1061,30 @@ setGroupAnnounce: {
     responseDeserialize: deserialize_messages_Empty,
   },
   // send messages only by admins
+setGroupMemberAddMode: {
+    path: '/messages.MessageService/SetGroupMemberAddMode',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.JidBoolRequest,
+    responseType: gows_pb.Empty,
+    requestSerialize: serialize_messages_JidBoolRequest,
+    requestDeserialize: deserialize_messages_JidBoolRequest,
+    responseSerialize: serialize_messages_Empty,
+    responseDeserialize: deserialize_messages_Empty,
+  },
+  // who can add members - true - all members, false - admins only
+setGroupMemberShareHistoryMode: {
+    path: '/messages.MessageService/SetGroupMemberShareHistoryMode',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.JidBoolRequest,
+    responseType: gows_pb.Empty,
+    requestSerialize: serialize_messages_JidBoolRequest,
+    requestDeserialize: deserialize_messages_JidBoolRequest,
+    responseSerialize: serialize_messages_Empty,
+    responseDeserialize: deserialize_messages_Empty,
+  },
+  // who can share message history with new members - true - all members, false - admins only
 updateGroupParticipants: {
     path: '/messages.MessageService/UpdateGroupParticipants',
     requestStream: false,
@@ -1025,6 +1093,39 @@ updateGroupParticipants: {
     responseType: gows_pb.JsonList,
     requestSerialize: serialize_messages_UpdateParticipantsRequest,
     requestDeserialize: deserialize_messages_UpdateParticipantsRequest,
+    responseSerialize: serialize_messages_JsonList,
+    responseDeserialize: deserialize_messages_JsonList,
+  },
+  setGroupJoinApprovalMode: {
+    path: '/messages.MessageService/SetGroupJoinApprovalMode',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.JidBoolRequest,
+    responseType: gows_pb.Empty,
+    requestSerialize: serialize_messages_JidBoolRequest,
+    requestDeserialize: deserialize_messages_JidBoolRequest,
+    responseSerialize: serialize_messages_Empty,
+    responseDeserialize: deserialize_messages_Empty,
+  },
+  getGroupRequestParticipants: {
+    path: '/messages.MessageService/GetGroupRequestParticipants',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.JidRequest,
+    responseType: gows_pb.JsonList,
+    requestSerialize: serialize_messages_JidRequest,
+    requestDeserialize: deserialize_messages_JidRequest,
+    responseSerialize: serialize_messages_JsonList,
+    responseDeserialize: deserialize_messages_JsonList,
+  },
+  updateGroupRequestParticipants: {
+    path: '/messages.MessageService/UpdateGroupRequestParticipants',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.UpdateRequestParticipantsRequest,
+    responseType: gows_pb.JsonList,
+    requestSerialize: serialize_messages_UpdateRequestParticipantsRequest,
+    requestDeserialize: deserialize_messages_UpdateRequestParticipantsRequest,
     responseSerialize: serialize_messages_JsonList,
     responseDeserialize: deserialize_messages_JsonList,
   },
@@ -1096,6 +1197,33 @@ getProfilePicture: {
     requestDeserialize: deserialize_messages_ChatUnreadRequest,
     responseSerialize: serialize_messages_Empty,
     responseDeserialize: deserialize_messages_Empty,
+  },
+  //
+// Account
+//
+// Fetch the account's current reachout timelock state.
+fetchReachoutTimelock: {
+    path: '/messages.MessageService/FetchReachoutTimelock',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.Session,
+    responseType: gows_pb.Json,
+    requestSerialize: serialize_messages_Session,
+    requestDeserialize: deserialize_messages_Session,
+    responseSerialize: serialize_messages_Json,
+    responseDeserialize: deserialize_messages_Json,
+  },
+  // Fetch the account's current new-chat message capping (per-cycle quota).
+fetchMessageCapping: {
+    path: '/messages.MessageService/FetchMessageCapping',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.Session,
+    responseType: gows_pb.Json,
+    requestSerialize: serialize_messages_Session,
+    requestDeserialize: deserialize_messages_Session,
+    responseSerialize: serialize_messages_Json,
+    responseDeserialize: deserialize_messages_Json,
   },
   //
 // Message

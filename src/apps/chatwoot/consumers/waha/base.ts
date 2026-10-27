@@ -36,9 +36,11 @@ import { EngineHelper } from '@waha/apps/chatwoot/waha';
 import { EnsureSeconds } from '@waha/utils/timehelper';
 import { CHATWOOT_MESSAGE_CALENDAR_THRESHOLD_SECONDS } from '@waha/apps/chatwoot/env';
 import {
-  ChatWootAppConfig,
   ChatWootConfig,
+  ChatWootOutgoingMode,
 } from '@waha/apps/chatwoot/dto/config.dto';
+import { clearContent } from '@waha/apps/chatwoot/consumers/utils';
+import { SetExternalEcho } from '@waha/apps/chatwoot/api/webhook.guards';
 
 export function ListenEventsForChatWoot(config: ChatWootConfig) {
   const events = [
@@ -51,7 +53,8 @@ export function ListenEventsForChatWoot(config: ChatWootConfig) {
     WAHAEvents.CALL_ACCEPTED,
     WAHAEvents.CALL_REJECTED,
   ];
-  if (config.conversations.markAsRead) {
+  const conversations = config.conversations;
+  if (conversations.markAsRead || conversations.syncMessageStatus) {
     events.push(WAHAEvents.MESSAGE_ACK);
   }
   return events;
@@ -234,6 +237,7 @@ export abstract class MessageBaseHandler<
     protected session: WAHASessionAPI,
     protected l: Locale,
     protected waha: WAHASelf,
+    protected outgoingMode: ChatWootOutgoingMode,
   ) {}
 
   protected abstract getMessage(
@@ -319,6 +323,7 @@ export abstract class MessageBaseHandler<
       this.session,
       EngineHelper.ChatID(payload as any),
       this.l,
+      EngineHelper.PhoneNumber(payload as any),
     );
     const conversation = await this.repo.ConversationByContact(contactInfo);
     this.info.onConversationId(conversation.conversationId);
@@ -329,6 +334,8 @@ export abstract class MessageBaseHandler<
       `Created message as '${message.message_type}' from WhatsApp: ${response.id}`,
     );
     await this.saveMapping(response, payload);
+    // Clear attachments content to avoid saving it in the task result
+    message.attachments = clearContent(message.attachments);
     return message;
   }
 
@@ -398,10 +405,35 @@ export abstract class MessageBaseHandler<
       },
     );
 
-    const private_ = message.private ?? payload.fromMe;
-    const type = private_ ? MessageType.OUTGOING : MessageType.INCOMING;
+    // Send the message as a private note or as a regular message?
+    let private_ = message.private;
+    if (private_ === undefined) {
+      switch (this.outgoingMode) {
+        case ChatWootOutgoingMode.MESSAGE:
+          // Regular outgoing message, not a note
+          private_ = false;
+          break;
+        case ChatWootOutgoingMode.PRIVATE_NOTE:
+        default: // no value - old config, treat it as PRIVATE_NOTE
+          // Mark my messages as private notes
+          private_ = Boolean(payload.fromMe);
+          break;
+      }
+    }
+
+    // Send the message as incoming or outgoing?
+    let type: MessageType = MessageType.INCOMING;
+    if (payload.fromMe) {
+      // Any message from me is outgoing, private or not
+      type = MessageType.OUTGOING;
+    }
+    if (private_) {
+      // Private notes can only be sent as outgoing messages
+      type = MessageType.OUTGOING;
+    }
+
     content = this.finalizeContent(content, payload);
-    return {
+    const body: conversation_message_create = {
       content: content,
       message_type: type,
       private: private_,
@@ -410,6 +442,10 @@ export abstract class MessageBaseHandler<
         in_reply_to: replyTo,
       },
     };
+    if (payload.fromMe) {
+      SetExternalEcho(body);
+    }
+    return body;
   }
 
   async getReplyToChatWootMessageID(
